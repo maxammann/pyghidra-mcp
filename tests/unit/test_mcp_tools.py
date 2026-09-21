@@ -9,6 +9,7 @@ from pyghidra_mcp.mcp_tools import (
     decompile_function,
     goto,
     list_project_binaries,
+    rename_label,
     rename_variable,
     search_symbols_by_name,
     set_comment,
@@ -105,6 +106,36 @@ def test_rename_variable_uses_tool_path(monkeypatch):
     assert response.variable_kind == "parameter"
     assert response.old_name == "count"
     assert response.new_name == "item_count"
+
+
+def test_rename_label_uses_tool_path(monkeypatch):
+    pyghidra_context = Mock()
+    pyghidra_context.get_program_info.return_value = Mock()
+
+    fake_tools = Mock()
+    fake_tools.rename_label.return_value = {
+        "address": "1000042e3",
+        "old_name": "LAB_1000042e3",
+        "new_name": "parse_header",
+    }
+
+    ctx = Mock()
+    ctx.request_context.lifespan_context = pyghidra_context
+
+    monkeypatch.setattr("pyghidra_mcp.mcp_tools.GhidraTools", lambda _program_info: fake_tools)
+
+    response = rename_label(
+        binary_name="sample",
+        name_or_address="LAB_1000042e3",
+        new_name="parse_header",
+        ctx=ctx,
+    )
+
+    fake_tools.rename_label.assert_called_once_with("LAB_1000042e3", "parse_header")
+    assert response.binary_name == "sample"
+    assert response.address == "1000042e3"
+    assert response.old_name == "LAB_1000042e3"
+    assert response.new_name == "parse_header"
 
 
 def test_set_variable_type_uses_tool_path(monkeypatch):

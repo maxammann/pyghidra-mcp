@@ -109,6 +109,57 @@ class GhidraTools:
         variable_kind, variable = matches[0]
         return func, variable_kind, variable
 
+    def _resolve_decompiler_variable(
+        self,
+        func: "Function",
+        variable_name: str,
+        timeout: int = DEFAULT_DECOMPILE_TIMEOUT_SECONDS,
+    ) -> tuple[str, typing.Any]:
+        """Resolve a variable that exists only in the decompiler's HighFunction."""
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        monitor = ConsoleTaskMonitor()
+        deadline = time.monotonic() + timeout
+        with self.decompiler_pool.acquire(timeout=timeout) as decompiler:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out waiting for a decompiler after {timeout} seconds"
+                )
+            result: DecompileResults = decompiler.decompileFunction(
+                func, max(1, math.ceil(remaining)), monitor
+            )
+
+        error = str(result.getErrorMessage())
+        if error:
+            raise ValueError(f"Could not decompile function '{func.getName()}': {error}")
+
+        high_function = result.getHighFunction()
+        if high_function is None:
+            raise ValueError(f"Could not obtain HighFunction for '{func.getName()}'.")
+
+        matches = []
+        symbols = high_function.getLocalSymbolMap().getSymbols()
+        while symbols.hasNext():
+            symbol = symbols.next()
+            if not symbol.isGlobal() and str(symbol.getName()) == variable_name:
+                matches.append(symbol)
+
+        if not matches:
+            raise ValueError(
+                f"Variable '{variable_name}' not found in function '{func.getName()}', "
+                "including decompiler-generated variables."
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous decompiler variable '{variable_name}' in function "
+                f"'{func.getName()}'."
+            )
+
+        symbol = matches[0]
+        variable_kind = "decompiler_parameter" if symbol.isParameter() else "decompiler_local"
+        return variable_kind, symbol
+
     def _parse_data_type(self, type_name: str):
         from ghidra.util.data import DataTypeParser  # type: ignore
         from ghidra.util.data.DataTypeParser import AllowedDataTypes  # type: ignore
@@ -987,17 +1038,63 @@ class GhidraTools:
         }
 
     @handle_exceptions
+    def rename_label(self, name_or_address: str, new_name: str) -> dict:
+        """Rename one existing label by exact name or unambiguous address."""
+        from ghidra.program.model.symbol import SourceType, SymbolType
+
+        symbol = self.find_symbol(name_or_address)
+        if symbol.getSymbolType() != SymbolType.LABEL:
+            raise ValueError(
+                f"Symbol '{name_or_address}' is a {symbol.getSymbolType()}, not a label."
+            )
+
+        old_name = str(symbol.getName())
+        address = str(symbol.getAddress())
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: rename label {old_name} -> {new_name}",
+        ):
+            symbol.setName(new_name, SourceType.USER_DEFINED)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "address": address,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+
+    @handle_exceptions
     def rename_variable(
         self,
         function_name_or_address: str,
         variable_name: str,
         new_name: str,
     ) -> dict:
+        from ghidra.program.model.pcode import HighFunctionDBUtil
         from ghidra.program.model.symbol import SourceType
 
-        func, variable_kind, variable = self._resolve_function_variable(
-            function_name_or_address, variable_name
-        )
+        func = self.find_function(function_name_or_address)
+        database_matches: list[tuple[str, typing.Any]] = []
+        for param in func.getParameters():
+            if str(param.getName()) == variable_name:
+                database_matches.append(("parameter", param))
+        for local in func.getLocalVariables():
+            if str(local.getName()) == variable_name:
+                database_matches.append(("local", local))
+
+        if len(database_matches) > 1:
+            kinds = ", ".join(kind for kind, _ in database_matches)
+            raise ValueError(
+                f"Ambiguous variable '{variable_name}' in function '{func.getName()}' ({kinds})."
+            )
+
+        high_symbol = None
+        if database_matches:
+            variable_kind, variable = database_matches[0]
+        else:
+            variable_kind, high_symbol = self._resolve_decompiler_variable(func, variable_name)
+            variable = None
+
         old_name = str(variable_name)
         function_name = str(func.getName())
         function_address = str(func.getEntryPoint())
@@ -1005,7 +1102,12 @@ class GhidraTools:
             self.program,
             f"pyghidra-mcp: rename {variable_kind} {old_name} -> {new_name}",
         ):
-            variable.setName(new_name, SourceType.USER_DEFINED)
+            if high_symbol is not None:
+                HighFunctionDBUtil.updateDBVariable(
+                    high_symbol, new_name, None, SourceType.USER_DEFINED
+                )
+            else:
+                variable.setName(new_name, SourceType.USER_DEFINED)
 
         self.invalidate_decompiler_cache()
         return {

@@ -310,6 +310,25 @@ def rename_function(
 
 
 @mcp_error_handler
+def rename_label(
+    binary_name: str,
+    name_or_address: str,
+    new_name: str,
+    ctx: Context,
+) -> RenameResponse:
+    """Rename one existing label by its exact name or unambiguous address."""
+    pyghidra_context: MCPContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    result = _run_for_context(
+        pyghidra_context,
+        lambda: tools.rename_label(name_or_address, new_name),
+    )
+    result = cast(dict, result)
+    return RenameResponse(binary_name=binary_name, **result)
+
+
+@mcp_error_handler
 def rename_variable(
     binary_name: str,
     function_name_or_address: str,
@@ -317,7 +336,7 @@ def rename_variable(
     new_name: str,
     ctx: Context,
 ) -> VariableRenameResponse:
-    """Rename a parameter or local by exact name."""
+    """Rename a parameter, local, or decompiler-generated variable by exact name."""
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = GhidraTools(program_info)
